@@ -157,14 +157,18 @@ def speculative_sampling_v2(prefix : torch.Tensor, approx_model : torch.nn.Modul
             # x = x_[:prefix_len-1] + x_0, ... x_(gamma-1)
             
             is_all_accept = True
-            n = prefix_len - 1
+            n = prefix_len - 1 # Confirmed sequence length
+
             for i in range(gamma):
+                token_idx = prefix_len + i
+                draft_token = x[:, token_idx].item()
+                prob_draft_token = p[:, prefix_len + i - 1, draft_token]
+
                 if random_seed:
-                    torch.manual_seed(random_seed)
+                    torch.manual_seed(random_seed + i) # Vary seed per position
                 r = torch.rand(1, device = p.device)
-                j = x[:, prefix_len + i]
-                
-                if r < torch.min(torch.tensor([1], device=q.device), p[:, prefix_len + i - 1, j] / q[:, prefix_len + i - 1, j]):
+
+                if r < torch.min(torch.tensor([1], device=q.device), p[:, prefix_len + i - 1, draft_token] / q[:, prefix_len + i - 1, draft_token]):
                     # accept, and update n
                     n += 1
                 else:
@@ -183,3 +187,99 @@ def speculative_sampling_v2(prefix : torch.Tensor, approx_model : torch.nn.Modul
 
     return prefix
 
+
+@torch.no_grad()
+def self_speculative_sampling(prefix: torch.Tensor, model: torch.nn.Module,
+                             max_len: int, gamma: int = 4,
+                             temperature: float = 1, top_k: int = 0, top_p: float = 0,
+                             verbose: bool = False, random_seed: int = None) -> torch.Tensor:
+    """
+    Self-Speculative Sampling using a single model.
+
+    Generates draft tokens using the model itself and verifies them probabilistically.
+
+    Args:
+        prefix (torch.Tensor): input sequence, (batch, prefix_seqlen).
+        model (torch.nn.Module): The language model.
+        max_len (int): Max number of tokens to generate.
+        gamma (int): Number of draft tokens to generate per step.
+        temperature (float, optional): Sampling temperature. Defaults to 1.
+        top_k (int, optional): Top-k sampling. Defaults to 0 (disabled).
+        top_p (float, optional): Top-p nucleus sampling. Defaults to 0 (disabled).
+        verbose (bool, optional): Print debug info. Defaults to False.
+        random_seed (int, optional): Random seed. Defaults to None.
+
+    Returns:
+        torch.Tensor: generated tokens (batch, target_seqlen)
+    """
+    seq_len = prefix.shape[1]
+    T = seq_len + max_len
+
+    assert prefix.shape[0] == 1, "Input batch size must be 1"
+
+    device = model.device
+    model_cache = KVCacheModel(model, temperature, top_k, top_p)
+
+    accepted_count = 0
+    total_drafted = 0
+
+    with tqdm(total=T, desc="Self-Speculative Sampling") as pbar:
+        pbar.update(seq_len)
+        while prefix.shape[1] < T:
+            prefix_len = prefix.shape[1]
+            total_drafted += gamma
+
+            # Generate gamma draft tokens + 1 verification token
+            # drafts tensor shape: (batch, prefix_len + gamma)
+            drafts = model_cache.generate(prefix, gamma + 1)
+            draft_probs = model_cache._prob_history[:, prefix_len-1:-1, :] # Probabilities for draft tokens
+
+            n = prefix_len - 1 # Confirmed sequence length
+
+            for i in range(gamma):
+                token_idx = prefix_len + i
+                draft_token = drafts[:, token_idx].item()
+                prob_draft_token = draft_probs[:, i, draft_token]
+
+                if random_seed:
+                    torch.manual_seed(random_seed + i) # Vary seed per position
+                r = torch.rand(1, device=device)
+
+                if r < prob_draft_token:
+                    # Accept draft token
+                    if verbose:
+                        print(f"Accepted draft {draft_token}: \033[32m{Decoder().decode(torch.tensor([[draft_token]]))}\033[0m @ prob {prob_draft_token:.3f}")
+                    accepted_count += 1
+                    n += 1
+                else:
+                    # Reject draft token and sample from the verification distribution
+                    if verbose:
+                        print(f"Rejected draft {draft_token}: \033[31m{Decoder().decode(torch.tensor([[draft_token]]))}\033[0m @ prob {prob_draft_token:.3f}")
+
+                    # Sample from the 'correct' distribution P(x | prefix...n)
+                    resample_dist = model_cache._prob_history[:, n, :]
+                    t = sample(resample_dist)
+                    if verbose:
+                        print(f"Resampled: \033[34m{Decoder().decode(t)}\033[0m")
+                    prefix = drafts[:, :n+1] # Keep accepted prefix
+                    prefix = torch.cat((prefix, t), dim=1)
+                    model_cache.rollback(n + 2) # Rollback cache to end of new prefix
+                    break # End draft verification for this step
+            else:
+                # All gamma drafts were accepted
+                # Sample the next token normally using the last distribution P(x | prefix...n+gamma)
+                t = sample(model_cache._prob_history[:, -1, :])
+                if verbose:
+                    print(f"All {gamma} drafts accepted. Sampled next: \033[35m{Decoder().decode(t)}\033[0m")
+                prefix = drafts[:, :n+2] # Keep all drafts
+                prefix = torch.cat((prefix, t), dim=1)
+                model_cache.rollback(n + 3) # Rollback cache (n+1 accepted, +1 final sample)
+
+            pbar.update(prefix.shape[1] - pbar.n)
+
+    if verbose:
+        accept_rate = accepted_count / total_drafted if total_drafted > 0 else 0
+        print(f"Finished. Generated {prefix.shape[1] - seq_len} tokens.")
+        print(f"Total drafted: {total_drafted}, Accepted: {accepted_count} (Rate: {accept_rate:.2f})")
+
+    return prefix[:,:T] # Trim to max length T

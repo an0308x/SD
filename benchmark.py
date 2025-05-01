@@ -1,9 +1,8 @@
-
 import torch
 import argparse
 import contexttimer
 from colorama import Fore, Style
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
 from sampling import autoregressive_sampling, speculative_sampling, speculative_sampling_v2
 from globals import Decoder
@@ -81,14 +80,63 @@ def generate(input_text, approx_model_name, target_model_name, num_tokens=100, g
     Decoder().set_tokenizer(tokenizer)
     
     print(f"begin loading models: \n {approx_model_name} \n {target_model_name}")
-    small_model = AutoModelForCausalLM.from_pretrained(approx_model_name, 
-                                                       torch_dtype=torch.float16,
-                                                       device_map="auto",
-                                                       trust_remote_code=True)
-    large_model = AutoModelForCausalLM.from_pretrained(target_model_name, 
-                                                       torch_dtype=torch.float16,
-                                                       device_map="auto",
-                                                       trust_remote_code=True)
+    
+    # Load approx model with config adjustment
+    print(f"Loading config for approx model: {approx_model_name}")
+    try:
+        approx_config = AutoConfig.from_pretrained(approx_model_name, trust_remote_code=True)
+        if hasattr(approx_config, "rope_scaling") and isinstance(approx_config.rope_scaling, dict):
+            print(f"Original approx rope_scaling: {approx_config.rope_scaling}")
+            required_keys = {'type', 'factor'}
+            if set(approx_config.rope_scaling.keys()) != required_keys:
+                original_rope_config = approx_config.rope_scaling
+                rope_type = original_rope_config.get('rope_type')
+                factor = original_rope_config.get('factor')
+                if rope_type is not None and factor is not None:
+                     new_rope_scaling = {'type': rope_type, 'factor': factor}
+                     print(f"Modifying approx rope_scaling to: {new_rope_scaling}")
+                     approx_config.rope_scaling = new_rope_scaling
+                else:
+                     print(f"Warning: Could not find 'rope_type' or 'factor' in approx rope_scaling config: {original_rope_config}, attempting to load without modification.")
+        
+        print("Loading approx model...")
+        small_model = AutoModelForCausalLM.from_pretrained(approx_model_name,
+                                                         config=approx_config,
+                                                         trust_remote_code=True
+                                                        ).to(torch_device)
+        print("Approx model loaded.")
+    except Exception as e:
+        print(f"Error loading approx model {approx_model_name}: {e}")
+        raise
+
+    # Load target model with config adjustment
+    print(f"Loading config for target model: {target_model_name}")
+    try:
+        target_config = AutoConfig.from_pretrained(target_model_name, trust_remote_code=True)
+        if hasattr(target_config, "rope_scaling") and isinstance(target_config.rope_scaling, dict):
+            print(f"Original target rope_scaling: {target_config.rope_scaling}")
+            required_keys = {'type', 'factor'}
+            if set(target_config.rope_scaling.keys()) != required_keys:
+                original_rope_config = target_config.rope_scaling
+                rope_type = original_rope_config.get('rope_type')
+                factor = original_rope_config.get('factor')
+                if rope_type is not None and factor is not None:
+                    new_rope_scaling = {'type': rope_type, 'factor': factor}
+                    print(f"Modifying target rope_scaling to: {new_rope_scaling}")
+                    target_config.rope_scaling = new_rope_scaling
+                else:
+                    print(f"Warning: Could not find 'rope_type' or 'factor' in target rope_scaling config: {original_rope_config}, attempting to load without modification.")
+
+        print("Loading target model...")
+        large_model = AutoModelForCausalLM.from_pretrained(target_model_name,
+                                                         config=target_config,
+                                                         trust_remote_code=True,
+                                                        ).to(torch_device)
+        print("Target model loaded.")
+    except Exception as e:
+        print(f"Error loading target model {target_model_name}: {e}")
+        raise
+        
     print("finish loading models")
     
     input_ids = tokenizer.encode(input_text, return_tensors='pt').to(torch_device)

@@ -3,6 +3,7 @@ from typing import Optional
 
 from sampling.utils import norm_logits, sample
 from transformers.models.bloom.modeling_bloom import BloomForCausalLM
+from transformers.models.llama.modeling_llama import LlamaForCausalLM
 
 def _debug_show_kvcache(past_key_values):
     if  past_key_values is None:
@@ -95,18 +96,25 @@ class KVCacheModel():
         assert self._past_key_values
         for kv in self._past_key_values:
             k, v = kv
-            # NOTE() the indexing is specific for bloom. This won't work for other models
-            # For example llama k, v should be (batch, num_head, seq_len, hidden_dim)
+            # NOTE() KV cache structure depends on the model type.
             
-            # Bloom is special one
             if isinstance(self._model, BloomForCausalLM):
-                # k (batch * head, hidden_dim, seq); v (batch * head, seq, hidden_dim)
+                # Bloom: k (batch * head, hidden_dim, seq); v (batch * head, seq, hidden_dim)
+                # print("Rollback: Bloom detected")
                 k = k[:, :, :end_pos]
                 v = v[:, :end_pos, :]
                 kv_trimmed = (k, v)
                 past_key_values_trimmed.append(kv_trimmed)
+            elif isinstance(self._model, LlamaForCausalLM):
+                # Llama: k, v (batch, head, seq, hidden_dim)
+                # print("Rollback: Llama detected")
+                k = k[:, :, :end_pos, :]
+                v = v[:, :, :end_pos, :]
+                kv_trimmed = (k, v)
+                past_key_values_trimmed.append(kv_trimmed)
             else:
-                # k, v (batch, head, seq, hidden_dim)
+                # Fallback/Generic case: Assume Llama-like shape but warn.
+                print(f"Warning: KVCacheModel.rollback encountered unknown model type {type(self._model)}. Assuming KV cache shape (batch, head, seq, hidden_dim). Adjust if necessary.")
                 k = k[:, :, :end_pos, :]
                 v = v[:, :, :end_pos, :]
                 kv_trimmed = (k, v)
@@ -114,4 +122,3 @@ class KVCacheModel():
         
         self._past_key_values = past_key_values_trimmed
         self._prob_history = self._prob_history[:, :end_pos, :]
-
